@@ -20,6 +20,7 @@ Environment:
 
 #include <tuple>
 #include <list>
+#include <set>
 #include <iostream>
 #include <thread>
 #include <mutex>
@@ -35,8 +36,8 @@ using namespace SUDOVDA;
 LUID preferredAdapterLuid{};
 bool preferredAdapterChanged = false;
 
-std::mutex monitorListOp;
-std::queue<size_t> freeConnectorSlots;
+std::recursive_mutex monitorListOp;
+std::set<size_t> freeConnectorSlots;
 std::list<IndirectMonitorContext*> monitorCtxList;
 
 bool isHDRSupported = false;
@@ -277,6 +278,31 @@ struct IndirectMonitorContextWrapper
 WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
 WDF_DECLARE_CONTEXT_TYPE(IndirectMonitorContextWrapper);
 
+// Cleanup callback for IDDCX_MONITOR objects
+// Called when Windows destroys the monitor (e.g., after HDR calibration triggers display reset)
+// This prevents using dangling pointers when attempting to reuse monitor handles
+static void MonitorCleanupCallback(WDFOBJECT Object)
+{
+	auto* pWrapper = WdfObjectGet_IndirectMonitorContextWrapper(Object);
+	if (pWrapper && pWrapper->pContext) {
+		auto* ctx = pWrapper->pContext;
+
+		// Lock to prevent race conditions with IOCTL handlers
+		std::lock_guard<std::recursive_mutex> lg(monitorListOp);
+
+		// Invalidate handle - it's being destroyed by Windows
+		ctx->SetMonitor(nullptr);
+
+		// Mark as disconnected but DON'T return connector slot to the pool.
+		// The slot stays reserved for this monitor so reconnect uses the same
+		// ConnectorIndex, preserving Windows device identity (ICC profiles, etc).
+		// The slot is only returned when REMOVE is called (permanent deletion).
+		if (ctx->isConnected) {
+			ctx->isConnected = false;
+		}
+	}
+}
+
 extern "C" BOOL WINAPI DllMain(
 	_In_ HINSTANCE hInstance,
 	_In_ UINT dwReason,
@@ -360,21 +386,209 @@ void LoadSettings() {
 	RegCloseKey(hKey);
 }
 
-void DisconnectAllMonitors() {
-	std::lock_guard<std::mutex> lg(monitorListOp);
+#pragma region DisplayPersistence
+
+// Registry path for persisted displays
+static const wchar_t* DISPLAYS_REGISTRY_PATH = L"SOFTWARE\\SudoMaker\\SudoVDA\\Displays";
+
+// Convert GUID to registry-safe wide string
+void GuidToWString(const GUID& guid, wchar_t* buffer, size_t bufferSize) {
+	swprintf_s(buffer, bufferSize, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		guid.Data1, guid.Data2, guid.Data3,
+		guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
+		guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+}
+
+// Parse GUID from wide string
+bool WStringToGuid(const wchar_t* str, GUID& guid) {
+	unsigned int data4[8];
+	int result = swscanf_s(str, L"{%08lX-%04hX-%04hX-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		&guid.Data1, &guid.Data2, &guid.Data3,
+		&data4[0], &data4[1], &data4[2], &data4[3],
+		&data4[4], &data4[5], &data4[6], &data4[7]);
+	if (result != 11) return false;
+	for (int i = 0; i < 8; i++) {
+		guid.Data4[i] = static_cast<unsigned char>(data4[i]);
+	}
+	return true;
+}
+
+// Save display to registry
+bool SaveDisplayToRegistry(const GUID& guid, DWORD width, DWORD height, DWORD vsync,
+                           const char* serialStr, const char* deviceName, DWORD connectorIndex) {
+	wchar_t guidStr[64];
+	GuidToWString(guid, guidStr, 64);
+
+	// Create the Displays key if it doesn't exist
+	HKEY hDisplaysKey;
+	LONG result = RegCreateKeyExW(HKEY_LOCAL_MACHINE, DISPLAYS_REGISTRY_PATH,
+		0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDisplaysKey, NULL);
+	if (result != ERROR_SUCCESS) {
+		return false;
+	}
+
+	// Create the subkey for this display
+	HKEY hDisplayKey;
+	result = RegCreateKeyExW(hDisplaysKey, guidStr,
+		0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDisplayKey, NULL);
+	RegCloseKey(hDisplaysKey);
+	if (result != ERROR_SUCCESS) {
+		return false;
+	}
+
+	// Write values
+	RegSetValueExW(hDisplayKey, L"Width", 0, REG_DWORD, (LPBYTE)&width, sizeof(DWORD));
+	RegSetValueExW(hDisplayKey, L"Height", 0, REG_DWORD, (LPBYTE)&height, sizeof(DWORD));
+	RegSetValueExW(hDisplayKey, L"VSync", 0, REG_DWORD, (LPBYTE)&vsync, sizeof(DWORD));
+	RegSetValueExW(hDisplayKey, L"ConnectorIndex", 0, REG_DWORD, (LPBYTE)&connectorIndex, sizeof(DWORD));
+
+	// Write string values (convert to wide strings)
+	if (serialStr && serialStr[0]) {
+		wchar_t wSerialStr[14];
+		MultiByteToWideChar(CP_UTF8, 0, serialStr, -1, wSerialStr, 14);
+		RegSetValueExW(hDisplayKey, L"SerialStr", 0, REG_SZ, (LPBYTE)wSerialStr, (DWORD)(wcslen(wSerialStr) + 1) * sizeof(wchar_t));
+	}
+	if (deviceName && deviceName[0]) {
+		wchar_t wDeviceName[14];
+		MultiByteToWideChar(CP_UTF8, 0, deviceName, -1, wDeviceName, 14);
+		RegSetValueExW(hDisplayKey, L"DeviceName", 0, REG_SZ, (LPBYTE)wDeviceName, (DWORD)(wcslen(wDeviceName) + 1) * sizeof(wchar_t));
+	}
+
+	RegCloseKey(hDisplayKey);
+	return true;
+}
+
+// Remove display from registry
+bool RemoveDisplayFromRegistry(const GUID& guid) {
+	wchar_t guidStr[64];
+	GuidToWString(guid, guidStr, 64);
+
+	HKEY hDisplaysKey;
+	LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, DISPLAYS_REGISTRY_PATH,
+		0, KEY_WRITE, &hDisplaysKey);
+	if (result != ERROR_SUCCESS) {
+		return false;
+	}
+
+	result = RegDeleteKeyW(hDisplaysKey, guidStr);
+	RegCloseKey(hDisplaysKey);
+	return result == ERROR_SUCCESS;
+}
+
+// Load all persisted displays (returns count loaded)
+int LoadPersistedDisplays(IDDCX_ADAPTER adapter) {
+	HKEY hDisplaysKey;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, DISPLAYS_REGISTRY_PATH,
+		0, KEY_READ, &hDisplaysKey) != ERROR_SUCCESS) {
+		return 0;  // No displays to load
+	}
+
+	int loaded = 0;
+	wchar_t guidStr[64];
+	DWORD index = 0;
+	DWORD guidStrSize;
+
+	while (true) {
+		guidStrSize = 64;
+		if (RegEnumKeyExW(hDisplaysKey, index++, guidStr, &guidStrSize, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+			break;
+		}
+
+		GUID guid;
+		if (!WStringToGuid(guidStr, guid)) continue;
+
+		HKEY hDisplayKey;
+		if (RegOpenKeyExW(hDisplaysKey, guidStr, 0, KEY_READ, &hDisplayKey) != ERROR_SUCCESS)
+			continue;
+
+		// Read values
+		DWORD width = 0, height = 0, vsync = 0, connectorIndex = MAXDWORD;
+		DWORD bufferSize;
+
+		bufferSize = sizeof(DWORD);
+		RegQueryValueExW(hDisplayKey, L"Width", NULL, NULL, (LPBYTE)&width, &bufferSize);
+		bufferSize = sizeof(DWORD);
+		RegQueryValueExW(hDisplayKey, L"Height", NULL, NULL, (LPBYTE)&height, &bufferSize);
+		bufferSize = sizeof(DWORD);
+		RegQueryValueExW(hDisplayKey, L"VSync", NULL, NULL, (LPBYTE)&vsync, &bufferSize);
+		bufferSize = sizeof(DWORD);
+		RegQueryValueExW(hDisplayKey, L"ConnectorIndex", NULL, NULL, (LPBYTE)&connectorIndex, &bufferSize);
+
+		wchar_t wSerialStr[14] = {};
+		wchar_t wDeviceName[14] = {};
+		bufferSize = sizeof(wSerialStr);
+		RegQueryValueExW(hDisplayKey, L"SerialStr", NULL, NULL, (LPBYTE)wSerialStr, &bufferSize);
+		bufferSize = sizeof(wDeviceName);
+		RegQueryValueExW(hDisplayKey, L"DeviceName", NULL, NULL, (LPBYTE)wDeviceName, &bufferSize);
+
+		RegCloseKey(hDisplayKey);
+
+		// Validate loaded values
+		if (width == 0 || height == 0 || vsync == 0) continue;
+
+		// Convert wide strings to char
+		char serialStr[14] = {};
+		char deviceName[14] = {};
+		WideCharToMultiByte(CP_UTF8, 0, wSerialStr, -1, serialStr, 14, NULL, NULL);
+		WideCharToMultiByte(CP_UTF8, 0, wDeviceName, -1, deviceName, 14, NULL, NULL);
+
+		// Create context in disconnected state
+		std::lock_guard<std::recursive_mutex> lg(monitorListOp);
+
+		auto* ctx = new IndirectMonitorContext();  // Parameterless constructor
+		ctx->monitorGuid = guid;
+		ctx->preferredMode = {width, height, vsync};
+		ctx->isConnected = false;
+		strncpy(ctx->serialStr, serialStr, 13);
+		strncpy(ctx->deviceName, deviceName, 13);
+		ctx->pEdidData = generate_edid(guid.Data1, guid.Data2, serialStr, deviceName);
+		ctx->m_Adapter = adapter;
+
+		// Restore persisted connector index and reserve it from the free pool
+		if (connectorIndex < MaxVirtualMonitorCount) {
+			ctx->connectorId = connectorIndex;
+			freeConnectorSlots.erase(connectorIndex);  // Reserve this slot
+		}
+
+		monitorCtxList.emplace_back(ctx);
+		loaded++;
+	}
+
+	RegCloseKey(hDisplaysKey);
+	return loaded;
+}
+
+#pragma endregion
+
+void DisconnectAllMonitors(bool deleteContexts = false) {
+	std::lock_guard<std::recursive_mutex> lg(monitorListOp);
 
 	if (monitorCtxList.empty()) {
 		return;
 	}
 
-	for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
+	for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ) {
 		auto* ctx = *it;
-		// Remove the monitor
-		freeConnectorSlots.push(ctx->connectorId);
-		IddCxMonitorDeparture(ctx->GetMonitor());
-	}
 
-	monitorCtxList.clear();
+		// Disconnect if currently connected
+		if (ctx->isConnected) {
+			// Only return slot to pool if we're deleting contexts
+			// (matches IOCTL_DISCONNECT behavior which preserves slots)
+			if (deleteContexts) {
+				freeConnectorSlots.insert(ctx->connectorId);
+			}
+			IddCxMonitorDeparture(ctx->GetMonitor());
+			ctx->isConnected = false;
+			ctx->SetMonitor(nullptr);
+		}
+
+		if (deleteContexts) {
+			delete ctx;
+			it = monitorCtxList.erase(it);
+		} else {
+			++it;  // Keep context in list for GUID matching
+		}
+	}
 }
 
 void RunWatchdog() {
@@ -392,10 +606,10 @@ void RunWatchdog() {
 					watchdogCountdown -= 1;
 
 					if (!watchdogCountdown) {
-						DisconnectAllMonitors();
+						DisconnectAllMonitors(false);  // Keep contexts for GUID matching
 					}
 				} else {
-					DisconnectAllMonitors();
+					DisconnectAllMonitors(false);  // Keep contexts for GUID matching
 					return;
 				}
 			}
@@ -445,9 +659,8 @@ void SudoVDADriverUnload(_In_ WDFDRIVER) {
 	if (watchdogTimeout > 0) {
 		watchdogTimeout = 0;
 		watchdogThread.join();
-	} else {
-		DisconnectAllMonitors();
 	}
+	DisconnectAllMonitors(true);  // Delete everything - driver is unloading
 }
 
 VOID SudoVDAIoDeviceControl(
@@ -772,7 +985,7 @@ IndirectDeviceContext::IndirectDeviceContext(_In_ WDFDEVICE WdfDevice) :
 {
 	m_Adapter = {};
 	for (size_t i = 0; i < MaxVirtualMonitorCount; i++) {
-		freeConnectorSlots.push(i);
+		freeConnectorSlots.insert(i);
 	}
 }
 
@@ -854,12 +1067,13 @@ NTSTATUS IndirectDeviceContext::CreateMonitor(IndirectMonitorContext*& pMonitorC
 
 	WDF_OBJECT_ATTRIBUTES Attr;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
+	Attr.EvtCleanupCallback = MonitorCleanupCallback;
 
 	// In the sample driver, we report a monitor right away but a real driver would do this when a monitor connection event occurs
 	IDDCX_MONITOR_INFO MonitorInfo = {};
 	MonitorInfo.Size = sizeof(MonitorInfo);
 	MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-	MonitorInfo.ConnectorIndex = (UINT)freeConnectorSlots.front();
+	MonitorInfo.ConnectorIndex = (UINT)*freeConnectorSlots.begin();
 
 	MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
 	MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
@@ -876,7 +1090,7 @@ NTSTATUS IndirectDeviceContext::CreateMonitor(IndirectMonitorContext*& pMonitorC
 	NTSTATUS Status = IddCxMonitorCreate(m_Adapter, &MonitorCreate, &MonitorCreateOut);
 	if (NT_SUCCESS(Status))
 	{
-		freeConnectorSlots.pop();
+		freeConnectorSlots.erase(freeConnectorSlots.begin());
 		// Create a new monitor context object and attach it to the Idd monitor object
 		auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
 		pMonitorContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject);
@@ -894,6 +1108,14 @@ NTSTATUS IndirectDeviceContext::CreateMonitor(IndirectMonitorContext*& pMonitorC
 		if (NT_SUCCESS(Status)) {
 			pMonitorContext->adapterLuid = ArrivalOut.OsAdapterLuid;
 			pMonitorContext->targetId = ArrivalOut.OsTargetId;
+			pMonitorContext->isConnected = true;
+
+			// Add to list ONLY after arrival succeeded - context is now fully valid
+			monitorCtxList.emplace_back(pMonitorContext);
+		} else {
+			// Arrival failed - clean up to avoid leak and invalid state
+			delete pMonitorContext;
+			pMonitorContext = nullptr;
 		}
 	} else {
 		// Avoid memory leak
@@ -906,8 +1128,14 @@ NTSTATUS IndirectDeviceContext::CreateMonitor(IndirectMonitorContext*& pMonitorC
 IndirectMonitorContext::IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor) :
 	m_Monitor(Monitor)
 {
-	// Store context for later use
-	monitorCtxList.emplace_back(this);
+	// Don't add to monitorCtxList here - caller will add after full initialization
+	// This prevents race conditions where Windows callbacks access partially initialized contexts
+}
+
+IndirectMonitorContext::IndirectMonitorContext() :
+	m_Monitor(nullptr)
+{
+	// Don't add to monitorCtxList - caller will do it for persisted displays
 }
 
 IndirectMonitorContext::~IndirectMonitorContext()
@@ -988,7 +1216,7 @@ void IndirectMonitorContext::UnassignSwapChain()
 #pragma region DDI Callbacks
 
 void IndirectDeviceContext::_TestCreateMonitor() {
-	auto connectorIndex = freeConnectorSlots.front();
+	auto connectorIndex = *freeConnectorSlots.begin();
 	std::string idx = std::to_string(connectorIndex);
 	std::string serialStr = "VDD2408";
 	serialStr += idx;
@@ -996,7 +1224,7 @@ void IndirectDeviceContext::_TestCreateMonitor() {
 	dispName += idx;
 	GUID containerId;
 	CoCreateGuid(&containerId);
-	uint8_t* edidData = generate_edid(containerId.Data1, serialStr.c_str(), dispName.c_str());
+	uint8_t* edidData = generate_edid(containerId.Data1, containerId.Data2, serialStr.c_str(), dispName.c_str());
 
 	VirtualMonitorMode mode{3000 + (DWORD)connectorIndex * 2, 2120 + (DWORD)connectorIndex, 120 + (DWORD)connectorIndex};
 
@@ -1016,6 +1244,9 @@ NTSTATUS SudoVDAAdapterInitFinished(IDDCX_ADAPTER AdapterObject, const IDARG_IN_
 			IddCxAdapterSetRenderAdapter(AdapterObject, &inArgs);
 			preferredAdapterChanged = false;
 		}
+
+		// Load persisted displays (in disconnected state) for cross-reboot recovery
+		LoadPersistedDisplays(AdapterObject);
 	}
 
 	if (testMode) {
@@ -1077,7 +1308,7 @@ NTSTATUS SudoVDAParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* 
 	VirtualMonitorMode* pPreferredMode = nullptr;
 
 	for (auto &it: monitorCtxList) {
-		if (memcmp(pInArgs->MonitorDescription.pData, it->pEdidData, sizeof(edid_base)) == 0) {
+		if (it->pEdidData && memcmp(pInArgs->MonitorDescription.pData, it->pEdidData, sizeof(edid_base)) == 0) {
 			if (it->preferredMode.Width) {
 				// We're adding 10 different modes, 1 original and 4 scaled x doubled refresh rate
 				pOutArgs->MonitorModeBufferOutputCount += std::size(mode_scale_factors) * 2;
@@ -1165,7 +1396,7 @@ NTSTATUS SudoVDAParseMonitorDescription2(
 	VirtualMonitorMode* pPreferredMode = nullptr;
 
 	for (auto &it: monitorCtxList) {
-		if (memcmp(pInArgs->MonitorDescription.pData, it->pEdidData, sizeof(edid_base)) == 0) {
+		if (it->pEdidData && memcmp(pInArgs->MonitorDescription.pData, it->pEdidData, sizeof(edid_base)) == 0) {
 			if (it->preferredMode.Width) {
 				// We're adding 10 different modes, 1 original and 4 scaled x doubled refresh rate
 				pOutArgs->MonitorModeBufferOutputCount += std::size(mode_scale_factors) * 2;
@@ -1495,11 +1726,6 @@ VOID SudoVDAIoDeviceControl(
 
 	switch (IoControlCode) {
 	case IOCTL_ADD_VIRTUAL_DISPLAY: {
-		if (freeConnectorSlots.empty()) {
-			Status = STATUS_TOO_MANY_NODES;
-			break;
-		}
-
 		if (InputBufferLength < sizeof(VIRTUAL_DISPLAY_ADD_PARAMS) || OutputBufferLength < sizeof(VIRTUAL_DISPLAY_ADD_OUT)) {
 			Status = STATUS_BUFFER_TOO_SMALL;
 			break;
@@ -1517,32 +1743,116 @@ VOID SudoVDAIoDeviceControl(
 			break;
 		}
 
-		bool guidFound = false;
+		IndirectMonitorContext* existingCtx = nullptr;
 
 		for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
 			auto* ctx = *it;
 			if (ctx->monitorGuid == params->MonitorGuid) {
-				guidFound = true;
-				output->AdapterLuid = ctx->adapterLuid;
-				output->TargetId = ctx->targetId;
-				bytesReturned = sizeof(VIRTUAL_DISPLAY_ADD_OUT);
+				existingCtx = ctx;
 				break;
 			}
 		}
 
-		if (guidFound) {
-			Status = STATUS_SUCCESS;
+		if (existingCtx) {
+			if (existingCtx->isConnected) {
+				// Already connected - return existing info
+				output->AdapterLuid = existingCtx->adapterLuid;
+				output->TargetId = existingCtx->targetId;
+				bytesReturned = sizeof(VIRTUAL_DISPLAY_ADD_OUT);
+				Status = STATUS_SUCCESS;
+			} else {
+				// Found but disconnected (persisted display) - need to reconnect
+				std::lock_guard<std::recursive_mutex> lg(monitorListOp);
+
+				IDARG_OUT_MONITORARRIVAL ArrivalOut = {};
+
+				if (existingCtx->GetMonitor() != nullptr) {
+					// Has monitor handle - try to call arrival
+					Status = IddCxMonitorArrival(existingCtx->GetMonitor(), &ArrivalOut);
+					if (!NT_SUCCESS(Status)) {
+						// Handle is stale (Windows destroyed the object but cleanup callback hasn't run yet)
+						// Invalidate the handle and fall through to create a new monitor
+						existingCtx->SetMonitor(nullptr);
+					}
+				}
+
+				if (existingCtx->GetMonitor() == nullptr) {
+					// No monitor handle (persisted from registry or stale handle) - need to create one
+					UINT connectorIndex;
+					if (existingCtx->connectorId < MaxVirtualMonitorCount) {
+						connectorIndex = (UINT)existingCtx->connectorId;
+						freeConnectorSlots.erase(existingCtx->connectorId);
+					} else {
+						if (freeConnectorSlots.empty()) {
+							Status = STATUS_TOO_MANY_NODES;
+							break;
+						}
+						connectorIndex = (UINT)*freeConnectorSlots.begin();
+						freeConnectorSlots.erase(freeConnectorSlots.begin());
+					}
+
+					WDF_OBJECT_ATTRIBUTES Attr;
+					WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
+					Attr.EvtCleanupCallback = MonitorCleanupCallback;
+
+					IDDCX_MONITOR_INFO MonitorInfo = {};
+					MonitorInfo.Size = sizeof(MonitorInfo);
+					MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+					MonitorInfo.ConnectorIndex = connectorIndex;
+					MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
+					MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+					MonitorInfo.MonitorDescription.DataSize = sizeof(edid_base);
+					MonitorInfo.MonitorDescription.pData = existingCtx->pEdidData;
+					MonitorInfo.MonitorContainerId = existingCtx->monitorGuid;
+
+					IDARG_IN_MONITORCREATE MonitorCreate = {};
+					MonitorCreate.ObjectAttributes = &Attr;
+					MonitorCreate.pMonitorInfo = &MonitorInfo;
+
+					IDARG_OUT_MONITORCREATE MonitorCreateOut;
+					Status = IddCxMonitorCreate(existingCtx->m_Adapter, &MonitorCreate, &MonitorCreateOut);
+
+					if (!NT_SUCCESS(Status)) {
+						freeConnectorSlots.insert(connectorIndex);
+						break;
+					}
+
+					auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
+					pMonitorContextWrapper->pContext = existingCtx;
+
+					existingCtx->SetMonitor(MonitorCreateOut.MonitorObject);
+					existingCtx->connectorId = connectorIndex;
+
+					Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+				}
+
+				if (NT_SUCCESS(Status)) {
+					existingCtx->adapterLuid = ArrivalOut.OsAdapterLuid;
+					existingCtx->targetId = ArrivalOut.OsTargetId;
+					existingCtx->isConnected = true;
+
+					output->AdapterLuid = existingCtx->adapterLuid;
+					output->TargetId = existingCtx->targetId;
+					bytesReturned = sizeof(VIRTUAL_DISPLAY_ADD_OUT);
+				}
+			}
+			break;
+		}
+
+		// Check if we have free slots before creating a new display
+		if (freeConnectorSlots.empty()) {
+			Status = STATUS_TOO_MANY_NODES;
 			break;
 		}
 
 		// Validate and add the virtual display
 		if (params->Width > 0 && params->Height > 0 && params->RefreshRate > 0) {
-			std::lock_guard<std::mutex> lg(monitorListOp);
+			std::lock_guard<std::recursive_mutex> lg(monitorListOp);
 
 			auto* pDeviceContextWrapper = WdfObjectGet_IndirectDeviceContextWrapper(Device);
 
 			IndirectMonitorContext* pMonitorContext;
-			uint8_t* edidData = generate_edid(params->MonitorGuid.Data1, params->SerialNumber, params->DeviceName);
+			uint8_t* edidData = generate_edid(params->MonitorGuid.Data1, params->MonitorGuid.Data2, params->SerialNumber, params->DeviceName);
 			VirtualMonitorMode preferredMode = {params->Width, params->Height, params->RefreshRate};
 			if (preferredMode.VSync < 1000) {
 				preferredMode.VSync *= 1000;
@@ -1552,6 +1862,16 @@ VOID SudoVDAIoDeviceControl(
 			if (!NT_SUCCESS(Status)) {
 				break;
 			}
+
+			// Store EDID params in context for persistence
+			strncpy(pMonitorContext->serialStr, params->SerialNumber, 13);
+			strncpy(pMonitorContext->deviceName, params->DeviceName, 13);
+
+			// Persist to registry for cross-reboot recovery
+			SaveDisplayToRegistry(params->MonitorGuid,
+				preferredMode.Width, preferredMode.Height, preferredMode.VSync,
+				params->SerialNumber, params->DeviceName,
+				(DWORD)pMonitorContext->connectorId);
 
 			output->AdapterLuid = pMonitorContext->adapterLuid;
 			output->TargetId = pMonitorContext->targetId;
@@ -1577,16 +1897,191 @@ VOID SudoVDAIoDeviceControl(
 
 		Status = STATUS_NOT_FOUND;
 
-		std::lock_guard<std::mutex> lg(monitorListOp);
+		std::lock_guard<std::recursive_mutex> lg(monitorListOp);
 
 		for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
 			auto* ctx = *it;
 			if (ctx->monitorGuid == params->MonitorGuid) {
-				// Remove the monitor
-				freeConnectorSlots.push(ctx->connectorId);
-				IddCxMonitorDeparture(ctx->GetMonitor());
+				// Remove from registry (permanent deletion)
+				RemoveDisplayFromRegistry(ctx->monitorGuid);
+
+				// Only disconnect if currently connected
+				if (ctx->isConnected) {
+					IddCxMonitorDeparture(ctx->GetMonitor());
+				}
+
+				// Return connector slot to the pool on permanent removal
+				// (This is the only place where slots should be returned)
+				freeConnectorSlots.insert(ctx->connectorId);
+
 				monitorCtxList.erase(it);
+				delete ctx;  // Free memory to avoid leak
 				Status = STATUS_SUCCESS;
+				break;
+			}
+		}
+
+		break;
+	}
+	case IOCTL_DISCONNECT_VIRTUAL_DISPLAY: {
+		if (InputBufferLength < sizeof(VIRTUAL_DISPLAY_DISCONNECT_PARAMS)) {
+			Status = STATUS_BUFFER_TOO_SMALL;
+			break;
+		}
+
+		PVIRTUAL_DISPLAY_DISCONNECT_PARAMS params;
+		Status = WdfRequestRetrieveInputBuffer(Request, sizeof(VIRTUAL_DISPLAY_DISCONNECT_PARAMS), (PVOID*)&params, NULL);
+		if (!NT_SUCCESS(Status)) {
+			break;
+		}
+
+		Status = STATUS_NOT_FOUND;
+
+		std::lock_guard<std::recursive_mutex> lg(monitorListOp);
+
+		for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
+			auto* ctx = *it;
+			if (ctx->monitorGuid == params->MonitorGuid) {
+				if (!ctx->isConnected) {
+					// Already disconnected
+					Status = STATUS_SUCCESS;
+					break;
+				}
+
+				// Disconnect: call IddCxMonitorDeparture but keep context in memory
+				// Keep the monitor handle and connector slot - we'll reuse them on reconnect
+				// to preserve Windows device identity (same handle = same device)
+				NTSTATUS departureStatus = IddCxMonitorDeparture(ctx->GetMonitor());
+				if (NT_SUCCESS(departureStatus)) {
+					ctx->isConnected = false;
+					// Don't return connector slot - it's bound to this monitor's handle
+					Status = STATUS_SUCCESS;
+				} else {
+					Status = departureStatus;
+				}
+				break;
+			}
+		}
+
+		break;
+	}
+	case IOCTL_RECONNECT_VIRTUAL_DISPLAY: {
+		if (InputBufferLength < sizeof(VIRTUAL_DISPLAY_RECONNECT_PARAMS) ||
+			OutputBufferLength < sizeof(VIRTUAL_DISPLAY_RECONNECT_OUT)) {
+			Status = STATUS_BUFFER_TOO_SMALL;
+			break;
+		}
+
+		PVIRTUAL_DISPLAY_RECONNECT_PARAMS params;
+		PVIRTUAL_DISPLAY_RECONNECT_OUT output;
+		Status = WdfRequestRetrieveInputBuffer(Request, sizeof(VIRTUAL_DISPLAY_RECONNECT_PARAMS), (PVOID*)&params, NULL);
+		if (!NT_SUCCESS(Status)) {
+			break;
+		}
+
+		Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(VIRTUAL_DISPLAY_RECONNECT_OUT), (PVOID*)&output, NULL);
+		if (!NT_SUCCESS(Status)) {
+			break;
+		}
+
+		Status = STATUS_NOT_FOUND;
+
+		std::lock_guard<std::recursive_mutex> lg(monitorListOp);
+
+		for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
+			auto* ctx = *it;
+			if (ctx->monitorGuid == params->MonitorGuid) {
+				if (ctx->isConnected) {
+					// Already connected - just return the existing info
+					output->AdapterLuid = ctx->adapterLuid;
+					output->TargetId = ctx->targetId;
+					bytesReturned = sizeof(VIRTUAL_DISPLAY_RECONNECT_OUT);
+					Status = STATUS_SUCCESS;
+					break;
+				}
+
+				IDARG_OUT_MONITORARRIVAL ArrivalOut = {};
+
+				if (ctx->GetMonitor() != nullptr) {
+					// Runtime-disconnected display: try to reuse existing monitor handle
+					// This preserves Windows device identity (same handle = same device)
+					Status = IddCxMonitorArrival(ctx->GetMonitor(), &ArrivalOut);
+					if (!NT_SUCCESS(Status)) {
+						// Handle is stale (Windows destroyed the object but cleanup callback hasn't run yet)
+						// Invalidate the handle and fall through to create a new monitor
+						ctx->SetMonitor(nullptr);
+					}
+				}
+
+				if (ctx->GetMonitor() == nullptr) {
+					// Persisted display or stale handle: no valid handle exists, need to create one
+					// Use preserved connector index if available, otherwise allocate new
+					UINT connectorIndex;
+					if (ctx->connectorId < MaxVirtualMonitorCount) {
+						// Use the preserved connector index for display persistence
+						connectorIndex = (UINT)ctx->connectorId;
+						// Remove from free pool if it's there (it might have been freed on driver restart)
+						freeConnectorSlots.erase(ctx->connectorId);
+					} else {
+						// No preserved connector, need to allocate a new one
+						if (freeConnectorSlots.empty()) {
+							Status = STATUS_TOO_MANY_NODES;
+							break;
+						}
+						connectorIndex = (UINT)*freeConnectorSlots.begin();
+						freeConnectorSlots.erase(freeConnectorSlots.begin());
+					}
+
+					WDF_OBJECT_ATTRIBUTES Attr;
+					WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
+					Attr.EvtCleanupCallback = MonitorCleanupCallback;
+
+					IDDCX_MONITOR_INFO MonitorInfo = {};
+					MonitorInfo.Size = sizeof(MonitorInfo);
+					MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+					MonitorInfo.ConnectorIndex = connectorIndex;
+
+					MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
+					MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+					MonitorInfo.MonitorDescription.DataSize = sizeof(edid_base);
+					MonitorInfo.MonitorDescription.pData = ctx->pEdidData;
+					MonitorInfo.MonitorContainerId = ctx->monitorGuid;
+
+					IDARG_IN_MONITORCREATE MonitorCreate = {};
+					MonitorCreate.ObjectAttributes = &Attr;
+					MonitorCreate.pMonitorInfo = &MonitorInfo;
+
+					IDARG_OUT_MONITORCREATE MonitorCreateOut;
+					Status = IddCxMonitorCreate(ctx->m_Adapter, &MonitorCreate, &MonitorCreateOut);
+
+					if (!NT_SUCCESS(Status)) {
+						// Return the connector slot on failure
+						freeConnectorSlots.insert(connectorIndex);
+						break;
+					}
+
+					// Update wrapper context to point to existing context (reuse it)
+					auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
+					pMonitorContextWrapper->pContext = ctx;
+
+					// Update context with new monitor handle and connector
+					ctx->SetMonitor(MonitorCreateOut.MonitorObject);
+					ctx->connectorId = connectorIndex;
+
+					// Notify OS of monitor arrival
+					Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+				}
+
+				if (NT_SUCCESS(Status)) {
+					ctx->adapterLuid = ArrivalOut.OsAdapterLuid;
+					ctx->targetId = ArrivalOut.OsTargetId;
+					ctx->isConnected = true;
+
+					output->AdapterLuid = ctx->adapterLuid;
+					output->TargetId = ctx->targetId;
+					bytesReturned = sizeof(VIRTUAL_DISPLAY_RECONNECT_OUT);
+				}
+
 				break;
 			}
 		}
@@ -1620,6 +2115,7 @@ VOID SudoVDAIoDeviceControl(
 		output->Timeout = watchdogTimeout;
 		output->Countdown = watchdogCountdown;
 		bytesReturned = sizeof(VIRTUAL_DISPLAY_GET_WATCHDOG_OUT);
+		break;
 	}
 	case IOCTL_DRIVER_PING: {
 		Status = STATUS_SUCCESS;
@@ -1636,6 +2132,7 @@ VOID SudoVDAIoDeviceControl(
 
 		output->Version = VDAProtocolVersion;
 		bytesReturned = sizeof(VIRTUAL_DISPLAY_GET_PROTOCOL_VERSION_OUT);
+		break;
 	}
 	default:
 		break;

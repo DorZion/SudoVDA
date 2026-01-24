@@ -1,5 +1,6 @@
 #pragma once
 
+#define EDID_OFFSET_MODEL 0x0A
 #define EDID_OFFSET_SERIAL 0x0C
 #define EDID_OFFSET_SERIALSTR 0x4D
 #define EDID_OFFSET_PRODNAME 0x71
@@ -26,7 +27,7 @@ const BYTE edid_base[] = {
 
 
 
-uint8_t* generate_edid(uint32_t serial, const char* serial_str, const char* prod_name) {
+uint8_t* generate_edid(uint32_t serial, uint16_t model_code, const char* serial_str, const char* prod_name) {
 	uint8_t* edid_data = (uint8_t*)malloc(sizeof(edid_base));
 
 	if (!edid_data) {
@@ -34,6 +35,10 @@ uint8_t* generate_edid(uint32_t serial, const char* serial_str, const char* prod
 	}
 
 	memcpy(edid_data, edid_base, sizeof(edid_base));
+
+	// Write model code (little-endian) - makes each client appear as different device model
+	edid_data[EDID_OFFSET_MODEL] = (uint8_t)(model_code & 0xFF);
+	edid_data[EDID_OFFSET_MODEL + 1] = (uint8_t)((model_code >> 8) & 0xFF);
 
 	memcpy(edid_data + EDID_OFFSET_SERIAL, &serial, 4);
 

@@ -84,18 +84,25 @@ namespace Microsoft
 			LUID adapterLuid{};
 			UINT targetId = 0;
 			GUID monitorGuid{};
+			bool isConnected = false;  // Only true after successful IddCxMonitorArrival
 
 			uint8_t* pEdidData = nullptr;
 			VirtualMonitorMode preferredMode{};
 			IDDCX_ADAPTER m_Adapter{};
 
+			// EDID regeneration parameters (for persistence across reboots)
+			CHAR serialStr[14] = {};
+			CHAR deviceName[14] = {};
+
 			IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor);
+			IndirectMonitorContext();  // For loading persisted displays
 			virtual ~IndirectMonitorContext();
 
 			void AssignSwapChain(const IDDCX_MONITOR& MonitorObject, const IDDCX_SWAPCHAIN& SwapChain, const LUID& RenderAdapter, const HANDLE& NewFrameEvent);
 			void UnassignSwapChain();
 
 			IDDCX_MONITOR GetMonitor() const;
+			void SetMonitor(IDDCX_MONITOR Monitor) { m_Monitor = Monitor; }
 
 		private:
 			IDDCX_MONITOR m_Monitor;
