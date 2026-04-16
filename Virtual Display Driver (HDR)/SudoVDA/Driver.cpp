@@ -24,6 +24,7 @@ Environment:
 #include <iostream>
 #include <thread>
 #include <mutex>
+#include <cstdarg>
 
 #include <AdapterOption.h>
 #include <sudovda-ioctl.h>
@@ -35,6 +36,11 @@ using namespace SUDOVDA;
 
 LUID preferredAdapterLuid{};
 bool preferredAdapterChanged = false;
+
+// Set in SudoVDADeviceAdd. Used by persistence helpers to obtain a handle to
+// the per-device PnP registry key (the only registry location Universal UMDF
+// drivers can write to without tripping InfVerif "legacy AddReg" errors).
+WDFDEVICE g_WdfDevice = nullptr;
 
 std::recursive_mutex monitorListOp;
 std::set<size_t> freeConnectorSlots;
@@ -279,7 +285,6 @@ WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
 WDF_DECLARE_CONTEXT_TYPE(IndirectMonitorContextWrapper);
 
 // Cleanup callback for IDDCX_MONITOR objects
-// Called when Windows destroys the monitor (e.g., after HDR calibration triggers display reset)
 // This prevents using dangling pointers when attempting to reuse monitor handles
 static void MonitorCleanupCallback(WDFOBJECT Object)
 {
@@ -287,10 +292,8 @@ static void MonitorCleanupCallback(WDFOBJECT Object)
 	if (pWrapper && pWrapper->pContext) {
 		auto* ctx = pWrapper->pContext;
 
-		// Lock to prevent race conditions with IOCTL handlers
 		std::lock_guard<std::recursive_mutex> lg(monitorListOp);
 
-		// Invalidate handle - it's being destroyed by Windows
 		ctx->SetMonitor(nullptr);
 
 		// Mark as disconnected but DON'T return connector slot to the pool.
@@ -313,6 +316,109 @@ extern "C" BOOL WINAPI DllMain(
 	UNREFERENCED_PARAMETER(dwReason);
 
 	return TRUE;
+}
+
+static void SudoVDALog(const wchar_t* fmt, ...) {
+	wchar_t buf[1024];
+	va_list args;
+	va_start(args, fmt);
+	int written = _vsnwprintf_s(buf, 1024, _TRUNCATE, fmt, args);
+	va_end(args);
+	if (written < 0) {
+		return;
+	}
+	OutputDebugStringW(buf);
+}
+
+#define SUVDA_LOG(fmt, ...) SudoVDALog(L"[SudoVDA] " fmt L"\n", __VA_ARGS__)
+
+// Extracts an EDID string field (serial string @ 0x4D or product name @ 0x71)
+// which is stored as up to 13 bytes, optionally terminated by 0x0A and padded
+// with spaces. Writes a trimmed, null-terminated copy to `out`.
+static void ExtractEdidString(const uint8_t* edidData, size_t offset, char out[EDID_STRING_FIELD_SIZE + 1]) {
+	memset(out, 0, EDID_STRING_FIELD_SIZE + 1);
+	if (!edidData) return;
+	for (size_t i = 0; i < EDID_STRING_FIELD_SIZE; i++) {
+		uint8_t c = edidData[offset + i];
+		if (c == 0x0A) break;
+		out[i] = (char)c;
+	}
+	// Trim trailing spaces
+	for (int i = EDID_STRING_FIELD_SIZE - 1; i >= 0; i--) {
+		if (out[i] == ' ') out[i] = 0;
+		else if (out[i]) break;
+	}
+}
+
+// Forward declaration; the definition lives in the DisplayPersistence region.
+void GuidToWString(const GUID& guid, wchar_t* buffer, size_t bufferSize);
+
+// Emits one log line per successful monitor arrival. Across reboots these
+// lines must be byte-for-byte identical for the same virtual monitor — that
+// is what preserves ICC/HDR profile associations in Windows.
+static void LogMonitorIdentity(const wchar_t* where,
+	const GUID& containerId, DWORD connectorIndex, DWORD osTargetId,
+	const uint8_t* edidData) {
+	wchar_t guidStr[64];
+	GuidToWString(containerId, guidStr, 64);
+	DWORD edidSerial = 0;
+	WORD edidModel = 0;
+	char edidSerialStr[EDID_STRING_FIELD_SIZE + 1] = {};
+	char edidProdName[EDID_STRING_FIELD_SIZE + 1] = {};
+	if (edidData) {
+		edidModel = (WORD)edidData[EDID_OFFSET_MODEL] | ((WORD)edidData[EDID_OFFSET_MODEL + 1] << 8);
+		memcpy(&edidSerial, edidData + EDID_OFFSET_SERIAL, 4);
+		ExtractEdidString(edidData, EDID_OFFSET_SERIALSTR, edidSerialStr);
+		ExtractEdidString(edidData, EDID_OFFSET_PRODNAME, edidProdName);
+	}
+	SUVDA_LOG(L"arrival[%s] container=%s connector=%lu osTargetId=%lu edidModel=0x%04X edidSerial=0x%08lX edidSerialStr=\"%S\" edidProdName=\"%S\"",
+		where, guidStr, connectorIndex, osTargetId, edidModel, edidSerial,
+		edidSerialStr, edidProdName);
+}
+
+// Opens the driver's "Displays" persistence subkey under the per-device PnP
+// registry key. Writable by the UMDF host (LocalService) without any ACL
+// gymnastics, and compliant with Universal-driver InfVerif rules (no HKLM
+// AddReg in the INF).
+//
+// On success, returns a raw HKEY and fills *outWdfKey with the owning WDFKEY.
+// The caller MUST call WdfRegistryClose(*outWdfKey) when done — this also
+// closes the HKEY.
+static HKEY OpenPersistenceKey(ACCESS_MASK access, bool createIfMissing, WDFKEY* outWdfKey) {
+	*outWdfKey = nullptr;
+	if (!g_WdfDevice) {
+		SUVDA_LOG(L"OpenPersistenceKey: g_WdfDevice is null");
+		return nullptr;
+	}
+
+	WDFKEY hDevKey = nullptr;
+	NTSTATUS s = WdfDeviceOpenRegistryKey(g_WdfDevice, PLUGPLAY_REGKEY_DEVICE,
+		KEY_ALL_ACCESS, WDF_NO_OBJECT_ATTRIBUTES, &hDevKey);
+	if (!NT_SUCCESS(s)) {
+		SUVDA_LOG(L"OpenPersistenceKey: WdfDeviceOpenRegistryKey failed, status=0x%08lX", s);
+		return nullptr;
+	}
+
+	DECLARE_CONST_UNICODE_STRING(displaysName, L"Displays");
+
+	WDFKEY hDisplaysKey = nullptr;
+	if (createIfMissing) {
+		s = WdfRegistryCreateKey(hDevKey, &displaysName, KEY_ALL_ACCESS,
+			REG_OPTION_NON_VOLATILE, NULL, WDF_NO_OBJECT_ATTRIBUTES, &hDisplaysKey);
+	} else {
+		s = WdfRegistryOpenKey(hDevKey, &displaysName, access,
+			WDF_NO_OBJECT_ATTRIBUTES, &hDisplaysKey);
+	}
+	WdfRegistryClose(hDevKey);
+	if (!NT_SUCCESS(s)) {
+		if (createIfMissing) {
+			SUVDA_LOG(L"OpenPersistenceKey: create Displays subkey failed, status=0x%08lX", s);
+		}
+		return nullptr;
+	}
+
+	*outWdfKey = hDisplaysKey;
+	return (HKEY)WdfRegistryWdmGetHandle(hDisplaysKey);
 }
 
 void LoadSettings() {
@@ -388,8 +494,11 @@ void LoadSettings() {
 
 #pragma region DisplayPersistence
 
-// Registry path for persisted displays
-static const wchar_t* DISPLAYS_REGISTRY_PATH = L"SOFTWARE\\SudoMaker\\SudoVDA\\Displays";
+// Persistence lives under the per-device PnP registry key's "Displays" subkey.
+// That full path is approximately:
+//   HKLM\SYSTEM\CurrentControlSet\Enum\Root\SudoMaker\SudoVDA\<N>\Device Parameters\Displays\{GUID}
+// It is writable by the UMDF host at runtime and allowed under InfVerif's
+// Universal-driver rules (no HKLM AddReg in the INF).
 
 // Convert GUID to registry-safe wide string
 void GuidToWString(const GUID& guid, wchar_t* buffer, size_t bufferSize) {
@@ -399,7 +508,6 @@ void GuidToWString(const GUID& guid, wchar_t* buffer, size_t bufferSize) {
 		guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
 }
 
-// Parse GUID from wide string
 bool WStringToGuid(const wchar_t* str, GUID& guid) {
 	unsigned int data4[8];
 	int result = swscanf_s(str, L"{%08lX-%04hX-%04hX-%02X%02X-%02X%02X%02X%02X%02X%02X}",
@@ -413,73 +521,91 @@ bool WStringToGuid(const wchar_t* str, GUID& guid) {
 	return true;
 }
 
-// Save display to registry
 bool SaveDisplayToRegistry(const GUID& guid, DWORD width, DWORD height, DWORD vsync,
                            const char* serialStr, const char* deviceName, DWORD connectorIndex) {
 	wchar_t guidStr[64];
 	GuidToWString(guid, guidStr, 64);
 
-	// Create the Displays key if it doesn't exist
-	HKEY hDisplaysKey;
-	LONG result = RegCreateKeyExW(HKEY_LOCAL_MACHINE, DISPLAYS_REGISTRY_PATH,
-		0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDisplaysKey, NULL);
-	if (result != ERROR_SUCCESS) {
+	WDFKEY hDisplaysWdfKey = nullptr;
+	HKEY hDisplaysKey = OpenPersistenceKey(KEY_ALL_ACCESS, /*createIfMissing=*/true, &hDisplaysWdfKey);
+	if (!hDisplaysKey) {
+		SUVDA_LOG(L"SaveDisplay: open Displays persistence key failed, guid=%s", guidStr);
 		return false;
 	}
 
-	// Create the subkey for this display
-	HKEY hDisplayKey;
-	result = RegCreateKeyExW(hDisplaysKey, guidStr,
-		0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDisplayKey, NULL);
-	RegCloseKey(hDisplaysKey);
+	HKEY hDisplayKey = nullptr;
+	LONG result = RegCreateKeyExW(hDisplaysKey, guidStr, 0, NULL,
+		REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hDisplayKey, NULL);
 	if (result != ERROR_SUCCESS) {
+		SUVDA_LOG(L"SaveDisplay: create per-display key failed, err=%ld guid=%s", result, guidStr);
+		WdfRegistryClose(hDisplaysWdfKey);
 		return false;
 	}
 
-	// Write values
-	RegSetValueExW(hDisplayKey, L"Width", 0, REG_DWORD, (LPBYTE)&width, sizeof(DWORD));
-	RegSetValueExW(hDisplayKey, L"Height", 0, REG_DWORD, (LPBYTE)&height, sizeof(DWORD));
-	RegSetValueExW(hDisplayKey, L"VSync", 0, REG_DWORD, (LPBYTE)&vsync, sizeof(DWORD));
-	RegSetValueExW(hDisplayKey, L"ConnectorIndex", 0, REG_DWORD, (LPBYTE)&connectorIndex, sizeof(DWORD));
+	LONG setResult = ERROR_SUCCESS;
+	LONG r;
+	r = RegSetValueExW(hDisplayKey, L"Width", 0, REG_DWORD, (LPBYTE)&width, sizeof(DWORD));
+	if (r != ERROR_SUCCESS) setResult = r;
+	r = RegSetValueExW(hDisplayKey, L"Height", 0, REG_DWORD, (LPBYTE)&height, sizeof(DWORD));
+	if (r != ERROR_SUCCESS) setResult = r;
+	r = RegSetValueExW(hDisplayKey, L"VSync", 0, REG_DWORD, (LPBYTE)&vsync, sizeof(DWORD));
+	if (r != ERROR_SUCCESS) setResult = r;
+	r = RegSetValueExW(hDisplayKey, L"ConnectorIndex", 0, REG_DWORD, (LPBYTE)&connectorIndex, sizeof(DWORD));
+	if (r != ERROR_SUCCESS) setResult = r;
 
-	// Write string values (convert to wide strings)
 	if (serialStr && serialStr[0]) {
 		wchar_t wSerialStr[14];
 		MultiByteToWideChar(CP_UTF8, 0, serialStr, -1, wSerialStr, 14);
-		RegSetValueExW(hDisplayKey, L"SerialStr", 0, REG_SZ, (LPBYTE)wSerialStr, (DWORD)(wcslen(wSerialStr) + 1) * sizeof(wchar_t));
+		r = RegSetValueExW(hDisplayKey, L"SerialStr", 0, REG_SZ, (LPBYTE)wSerialStr, (DWORD)(wcslen(wSerialStr) + 1) * sizeof(wchar_t));
+		if (r != ERROR_SUCCESS) setResult = r;
 	}
 	if (deviceName && deviceName[0]) {
 		wchar_t wDeviceName[14];
 		MultiByteToWideChar(CP_UTF8, 0, deviceName, -1, wDeviceName, 14);
-		RegSetValueExW(hDisplayKey, L"DeviceName", 0, REG_SZ, (LPBYTE)wDeviceName, (DWORD)(wcslen(wDeviceName) + 1) * sizeof(wchar_t));
+		r = RegSetValueExW(hDisplayKey, L"DeviceName", 0, REG_SZ, (LPBYTE)wDeviceName, (DWORD)(wcslen(wDeviceName) + 1) * sizeof(wchar_t));
+		if (r != ERROR_SUCCESS) setResult = r;
 	}
 
 	RegCloseKey(hDisplayKey);
+	WdfRegistryClose(hDisplaysWdfKey);
+
+	if (setResult != ERROR_SUCCESS) {
+		SUVDA_LOG(L"SaveDisplay: at least one RegSetValueEx failed, err=%ld guid=%s", setResult, guidStr);
+		return false;
+	}
+
+	SUVDA_LOG(L"SaveDisplay: ok guid=%s mode=%ux%u@%umHz connector=%lu serial=%S name=%S",
+		guidStr, width, height, vsync, connectorIndex,
+		serialStr ? serialStr : "", deviceName ? deviceName : "");
 	return true;
 }
 
-// Remove display from registry
 bool RemoveDisplayFromRegistry(const GUID& guid) {
 	wchar_t guidStr[64];
 	GuidToWString(guid, guidStr, 64);
 
-	HKEY hDisplaysKey;
-	LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, DISPLAYS_REGISTRY_PATH,
-		0, KEY_WRITE, &hDisplaysKey);
-	if (result != ERROR_SUCCESS) {
+	WDFKEY hDisplaysWdfKey = nullptr;
+	HKEY hDisplaysKey = OpenPersistenceKey(KEY_ALL_ACCESS, /*createIfMissing=*/false, &hDisplaysWdfKey);
+	if (!hDisplaysKey) {
+		// Nothing persisted yet — treat as a no-op.
 		return false;
 	}
 
-	result = RegDeleteKeyW(hDisplaysKey, guidStr);
-	RegCloseKey(hDisplaysKey);
-	return result == ERROR_SUCCESS;
+	LONG result = RegDeleteKeyW(hDisplaysKey, guidStr);
+	WdfRegistryClose(hDisplaysWdfKey);
+	if (result != ERROR_SUCCESS) {
+		SUVDA_LOG(L"RemoveDisplay: delete per-display key failed, err=%ld guid=%s", result, guidStr);
+		return false;
+	}
+	SUVDA_LOG(L"RemoveDisplay: ok guid=%s", guidStr);
+	return true;
 }
 
-// Load all persisted displays (returns count loaded)
 int LoadPersistedDisplays(IDDCX_ADAPTER adapter) {
-	HKEY hDisplaysKey;
-	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, DISPLAYS_REGISTRY_PATH,
-		0, KEY_READ, &hDisplaysKey) != ERROR_SUCCESS) {
+	WDFKEY hDisplaysWdfKey = nullptr;
+	HKEY hDisplaysKey = OpenPersistenceKey(KEY_READ, /*createIfMissing=*/false, &hDisplaysWdfKey);
+	if (!hDisplaysKey) {
+		SUVDA_LOG(L"LoadPersistedDisplays: Displays subkey not present (ok if no persisted displays yet)");
 		return 0;  // No displays to load
 	}
 
@@ -552,9 +678,14 @@ int LoadPersistedDisplays(IDDCX_ADAPTER adapter) {
 
 		monitorCtxList.emplace_back(ctx);
 		loaded++;
+
+		SUVDA_LOG(L"LoadPersistedDisplays: restored guid=%s mode=%ux%u@%umHz connector=%lu serial=%S name=%S",
+			guidStr, width, height, vsync, connectorIndex,
+			serialStr, deviceName);
 	}
 
-	RegCloseKey(hDisplaysKey);
+	WdfRegistryClose(hDisplaysWdfKey);
+	SUVDA_LOG(L"LoadPersistedDisplays: %d display(s) restored in disconnected state", loaded);
 	return loaded;
 }
 
@@ -736,6 +867,7 @@ NTSTATUS SudoVDADeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 	{
 		return Status;
 	}
+	g_WdfDevice = Device;
 
 	Status = WdfDeviceCreateDeviceInterface(
 		Device,
@@ -1112,6 +1244,10 @@ NTSTATUS IndirectDeviceContext::CreateMonitor(IndirectMonitorContext*& pMonitorC
 
 			// Add to list ONLY after arrival succeeded - context is now fully valid
 			monitorCtxList.emplace_back(pMonitorContext);
+
+			LogMonitorIdentity(L"fresh", pMonitorContext->monitorGuid,
+				(DWORD)pMonitorContext->connectorId, pMonitorContext->targetId,
+				pMonitorContext->pEdidData);
 		} else {
 			// Arrival failed - clean up to avoid leak and invalid state
 			delete pMonitorContext;
@@ -1834,6 +1970,19 @@ VOID SudoVDAIoDeviceControl(
 					output->AdapterLuid = existingCtx->adapterLuid;
 					output->TargetId = existingCtx->targetId;
 					bytesReturned = sizeof(VIRTUAL_DISPLAY_ADD_OUT);
+
+					LogMonitorIdentity(L"add-reconnect", existingCtx->monitorGuid,
+						(DWORD)existingCtx->connectorId, existingCtx->targetId,
+						existingCtx->pEdidData);
+
+					// Self-heal: re-persist current values so a manually-cleared
+					// registry entry gets rebuilt on the next successful reconnect.
+					SaveDisplayToRegistry(existingCtx->monitorGuid,
+						existingCtx->preferredMode.Width,
+						existingCtx->preferredMode.Height,
+						existingCtx->preferredMode.VSync,
+						existingCtx->serialStr, existingCtx->deviceName,
+						(DWORD)existingCtx->connectorId);
 				}
 			}
 			break;
@@ -2080,6 +2229,19 @@ VOID SudoVDAIoDeviceControl(
 					output->AdapterLuid = ctx->adapterLuid;
 					output->TargetId = ctx->targetId;
 					bytesReturned = sizeof(VIRTUAL_DISPLAY_RECONNECT_OUT);
+
+					LogMonitorIdentity(L"reconnect", ctx->monitorGuid,
+						(DWORD)ctx->connectorId, ctx->targetId,
+						ctx->pEdidData);
+
+					// Self-heal: re-persist current values so a manually-cleared
+					// registry entry gets rebuilt on the next successful reconnect.
+					SaveDisplayToRegistry(ctx->monitorGuid,
+						ctx->preferredMode.Width,
+						ctx->preferredMode.Height,
+						ctx->preferredMode.VSync,
+						ctx->serialStr, ctx->deviceName,
+						(DWORD)ctx->connectorId);
 				}
 
 				break;
