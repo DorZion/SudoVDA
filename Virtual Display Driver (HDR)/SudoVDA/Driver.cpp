@@ -704,8 +704,10 @@ void DisconnectAllMonitors(bool deleteContexts = false) {
 		// Disconnect if currently connected
 		if (ctx->isConnected) {
 			// Only return slot to pool if we're deleting contexts
-			// (matches IOCTL_DISCONNECT behavior which preserves slots)
-			if (deleteContexts) {
+			// (matches IOCTL_DISCONNECT behavior which preserves slots).
+			// Connected contexts always have a valid slot, but guard anyway
+			// against the MAXUINT sentinel for defense-in-depth.
+			if (deleteContexts && ctx->connectorId < MaxVirtualMonitorCount) {
 				freeConnectorSlots.insert(ctx->connectorId);
 			}
 			IddCxMonitorDeparture(ctx->GetMonitor());
@@ -1196,6 +1198,15 @@ NTSTATUS IndirectDeviceContext::CreateMonitor(IndirectMonitorContext*& pMonitorC
 	// to optimize settings like viewing distance and scale factor. Manufacturers should also use a unique serial
 	// number every single device to ensure the OS can tell the monitors apart.
 	// ==============================
+
+	if (freeConnectorSlots.empty()) {
+		// Avoid dereferencing begin() on an empty set. Callers in the IOCTL_ADD
+		// path pre-check this, but _TestCreateMonitor does not — and users can
+		// set MaxVirtualMonitorCount arbitrarily low.
+		pMonitorContext = nullptr;
+		free(edidData);
+		return STATUS_TOO_MANY_NODES;
+	}
 
 	WDF_OBJECT_ATTRIBUTES Attr;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
@@ -2060,8 +2071,12 @@ VOID SudoVDAIoDeviceControl(
 				}
 
 				// Return connector slot to the pool on permanent removal
-				// (This is the only place where slots should be returned)
-				freeConnectorSlots.insert(ctx->connectorId);
+				// (This is the only place where slots should be returned).
+				// Guard against leaking the MAXUINT sentinel (set on persisted
+				// contexts whose ConnectorIndex was missing/invalid) into the pool.
+				if (ctx->connectorId < MaxVirtualMonitorCount) {
+					freeConnectorSlots.insert(ctx->connectorId);
+				}
 
 				monitorCtxList.erase(it);
 				delete ctx;  // Free memory to avoid leak

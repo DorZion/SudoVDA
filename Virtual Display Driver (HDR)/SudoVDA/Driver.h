@@ -80,7 +80,12 @@ namespace Microsoft
 		class IndirectMonitorContext
 		{
 		public:
-			UINT connectorId = 0;
+			// MAXUINT is the "unassigned" sentinel — distinguishable from a valid
+			// persisted slot 0. A persisted context whose ConnectorIndex registry
+			// value was missing or out-of-range keeps this sentinel so downstream
+			// reconnect code falls through to allocating a fresh slot from the pool
+			// instead of colliding with whatever legitimately owns slot 0.
+			UINT connectorId = MAXUINT;
 			LUID adapterLuid{};
 			UINT targetId = 0;
 			GUID monitorGuid{};
